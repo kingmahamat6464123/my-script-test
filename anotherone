@@ -154,7 +154,7 @@ local highlights = {}
 local infoEspEnabled = false
 local infoEspObjects = {}
 local skeletonEspEnabled = false
-local skeletonObjects = {}
+local skeletonData = {}
 local squareEspEnabled = false
 local squareObjects = {}
 local showFOVEnabled = false
@@ -620,129 +620,159 @@ local function updateHighlight(player)
 end
 
 -- ============================================================================
--- SKELETON ESP (batched, single render loop, pooled lines)
+-- SKELETON ESP (Drawing lines, R6/R15, distance-colored, through walls)
 -- ============================================================================
 
-local skeletonRenderConnection = nil
-local skeletonLinePool = {}
-local skeletonColors = theme.Skeleton
+local R15_BONES = {
+	{"Head", "UpperTorso"},
+	{"UpperTorso", "LowerTorso"},
+	{"UpperTorso", "LeftUpperArm"},
+	{"LeftUpperArm", "LeftLowerArm"},
+	{"LeftLowerArm", "LeftHand"},
+	{"UpperTorso", "RightUpperArm"},
+	{"RightUpperArm", "RightLowerArm"},
+	{"RightLowerArm", "RightHand"},
+	{"LowerTorso", "LeftUpperLeg"},
+	{"LeftUpperLeg", "LeftLowerLeg"},
+	{"LeftLowerLeg", "LeftFoot"},
+	{"LowerTorso", "RightUpperLeg"},
+	{"RightUpperLeg", "RightLowerLeg"},
+	{"RightLowerLeg", "RightFoot"},
+}
+local R6_BONES = {
+	{"Head", "Torso"},
+	{"Torso", "Left Arm"},
+	{"Torso", "Right Arm"},
+	{"Torso", "Left Leg"},
+	{"Torso", "Right Leg"},
+}
 
-local function acquireSkeletonLine(folder)
-	local line = table.remove(skeletonLinePool)
-	if not line then
-		line = Instance.new("LineHandleAdornment")
-		line.Name = "SkeletonBone"
-		line.Color3 = skeletonColors
-		line.Thickness = 2
-		line.AlwaysOnTop = true
-		line.ZIndex = 4
-	end
-	line.Visible = true
-	line.Adornee = nil
-	line.Parent = folder
-	return line
+local function skeletonDistColor(dist)
+	local t = math.clamp(dist / 300, 0, 1)
+	return Color3.fromRGB(
+		math.floor(255 * t),
+		math.floor(255 * (1 - math.abs(t - 0.5) * 2)),
+		60
+	)
 end
 
-local function releaseSkeletonLine(line)
-	line.Visible = false
-	line.Adornee = nil
-	line.Parent = nil
-	table.insert(skeletonLinePool, line)
-end
+local function createSkeleton(player)
+	if player == localPlayer then return end
+	if not shouldShowEspPlayer(player) then return end
+	if skeletonData[player] then return end
 
-local function removeSkeletonESP(player)
-	local data = skeletonObjects[player]
-	if not data then
-		return
-	end
-	if data.folder then
-		for _, entry in ipairs(data.bones) do
-			releaseSkeletonLine(entry.line)
+	local data = { lines = {}, connections = {} }
+	skeletonData[player] = data
+
+	local function clearLines()
+		for _, line in ipairs(data.lines) do
+			if line and line.Remove then line:Remove() end
 		end
-		data.folder:Destroy()
+		data.lines = {}
 	end
-	skeletonObjects[player] = nil
 
-	if next(skeletonObjects) == nil and skeletonRenderConnection then
-		skeletonRenderConnection:Disconnect()
-		skeletonRenderConnection = nil
-	end
-end
+	local function build()
+		clearLines()
+		local char = player.Character
+		if not char then return end
+		local hum = char:FindFirstChildOfClass("Humanoid")
+		if not hum then return end
 
-local function updateAllSkeletons()
-	for _, data in pairs(skeletonObjects) do
-		local character = data.character
-		if not character or not character.Parent then
-			continue
-		end
-		local bones = data.bones
-		for i = 1, #bones do
-			local entry = bones[i]
-			local motor = entry.joint
-			local line = entry.line
-			local part0 = motor.Part0
-			local part1 = motor.Part1
-			if motor.Parent and part0 and part1 then
-				local worldA = (part0.CFrame * motor.C0 * motor.Transform).Position
-				local worldB = (part1.CFrame * motor.C1).Position
-
-				local localA = part0.CFrame:PointToObjectSpace(worldA)
-				local localB = part0.CFrame:PointToObjectSpace(worldB)
-
-				line.Adornee = part0
-				line.From = localA
-				line.To = localB
-				line.Visible = true
-			elseif line.Visible then
-				line.Visible = false
+		local bones = (hum.RigType == Enum.HumanoidRigType.R15) and R15_BONES or R6_BONES
+		for _, pair in ipairs(bones) do
+			local a = char:FindFirstChild(pair[1])
+			local b = char:FindFirstChild(pair[2])
+			if a and b and a:IsA("BasePart") and b:IsA("BasePart") then
+				local line = Drawing.new("Line")
+				line.Thickness = 1
+				line.Transparency = 1
+				line.Color = theme.Skeleton
+				line.Visible = skeletonEspEnabled
+				table.insert(data.lines, line)
+			else
+				table.insert(data.lines, false)
 			end
 		end
 	end
+
+	data._build = build
+	build()
+
+	table.insert(data.connections, player.CharacterAdded:Connect(function()
+		task.wait(0.6)
+		build()
+	end))
 end
 
-local function ensureSkeletonLoopRunning()
-	if skeletonRenderConnection then
-		return
+local function removeSkeletonESP(player)
+	local data = skeletonData[player]
+	if not data then return end
+	for _, c in ipairs(data.connections) do
+		if c then c:Disconnect() end
 	end
-	skeletonRenderConnection = RunService.RenderStepped:Connect(updateAllSkeletons)
+	for _, line in ipairs(data.lines) do
+		if line and line.Remove then line:Remove() end
+	end
+	skeletonData[player] = nil
 end
 
-local function updateSkeletonESP(player)
-	removeSkeletonESP(player)
-	if not skeletonEspEnabled or not shouldShowEspPlayer(player) then
-		return
-	end
+local function updateSkeletons()
+	local cam = workspace.CurrentCamera
+	if not cam then return end
+	local myChar = localPlayer.Character
+	local myHrp = myChar and myChar:FindFirstChild("HumanoidRootPart")
 
-	local character = player.Character
-	if not character then
-		return
-	end
+	for player, data in pairs(skeletonData) do
+		if not player.Parent or not player.Character then
+			removeSkeletonESP(player)
+			continue
+		end
 
-	local folder = Instance.new("Folder")
-	folder.Name = "AdminSkeletonESP_" .. tostring(player.UserId)
-	folder.Parent = screenGui
+		local char = player.Character
+		local hum = char:FindFirstChildOfClass("Humanoid")
+		local hrp = char:FindFirstChild("HumanoidRootPart")
 
-	local bones = {}
-	for _, joint in ipairs(character:GetDescendants()) do
-		if joint:IsA("Motor6D") and joint.Part0 and joint.Part1 then
-			local line = acquireSkeletonLine(folder)
-			table.insert(bones, { joint = joint, line = line })
+		if not (hum and hrp) then
+			for _, line in ipairs(data.lines) do
+				if line then line.Visible = false end
+			end
+			continue
+		end
+
+		local bones = (hum.RigType == Enum.HumanoidRigType.R15) and R15_BONES or R6_BONES
+
+		if #data.lines ~= #bones then
+			if data._build then data._build() end
+			continue
+		end
+
+		local dist = myHrp and (myHrp.Position - hrp.Position).Magnitude or 0
+		local color = skeletonDistColor(dist)
+
+		for i, pair in ipairs(bones) do
+			local line = data.lines[i]
+			local a = char:FindFirstChild(pair[1])
+			local b = char:FindFirstChild(pair[2])
+
+			if line then
+				if skeletonEspEnabled and a and b and a:IsA("BasePart") and b:IsA("BasePart") then
+					local aScreen, aOn = cam:WorldToViewportPoint(a.Position)
+					local bScreen, bOn = cam:WorldToViewportPoint(b.Position)
+
+					if aOn or bOn then
+						line.From = Vector2.new(aScreen.X, aScreen.Y)
+						line.To = Vector2.new(bScreen.X, bScreen.Y)
+						line.Color = color
+						line.Visible = true
+					else
+						line.Visible = false
+					end
+				else
+					line.Visible = false
+				end
+			end
 		end
 	end
-
-	if #bones == 0 then
-		folder:Destroy()
-		return
-	end
-
-	skeletonObjects[player] = {
-		folder = folder,
-		character = character,
-		bones = bones,
-	}
-
-	ensureSkeletonLoopRunning()
-	updateAllSkeletons()
 end
 
 -- ============================================================================
@@ -947,13 +977,13 @@ local function watchPlayer(player)
 			for _, target in ipairs(Players:GetPlayers()) do
 				updateHighlight(target)
 				updateInfoESP(target)
-				updateSkeletonESP(target)
+				createSkeleton(target)
 				updateSquareESP(target)
 			end
 		else
 			updateHighlight(player)
 			updateInfoESP(player)
-			updateSkeletonESP(player)
+			createSkeleton(player)
 			updateSquareESP(player)
 		end
 	end)
@@ -966,7 +996,7 @@ local function watchPlayer(player)
 		task.wait()
 		updateHighlight(player)
 		updateInfoESP(player)
-		updateSkeletonESP(player)
+		createSkeleton(player)
 		updateSquareESP(player)
 		if player == localPlayer then
 			rememberMovementDefaults(humanoid)
@@ -981,7 +1011,7 @@ local function watchPlayer(player)
 	end)
 	updateHighlight(player)
 	updateInfoESP(player)
-	updateSkeletonESP(player)
+	createSkeleton(player)
 	updateSquareESP(player)
 	if player == localPlayer then
 		local humanoid = getLocalHumanoid()
@@ -1026,8 +1056,14 @@ end)
 skeletonButton.Activated:Connect(function()
 	skeletonEspEnabled = not skeletonEspEnabled
 	updateToggleButton(skeletonButton, "Skeleton ESP", skeletonEspEnabled)
-	for _, player in ipairs(Players:GetPlayers()) do
-		updateSkeletonESP(player)
+	if skeletonEspEnabled then
+		for _, player in ipairs(Players:GetPlayers()) do
+			createSkeleton(player)
+		end
+	else
+		for player in pairs(skeletonData) do
+			removeSkeletonESP(player)
+		end
 	end
 end)
 
@@ -1851,19 +1887,17 @@ end
 
 resetMovementButton.Activated:Connect(resetMovement)
 
+-- Skeleton render loop (Drawing lines)
+RunService.RenderStepped:Connect(updateSkeletons)
+
 screenGui.Destroying:Connect(function()
 	RunService:UnbindFromRenderStep("AdminAimAssist")
 	if triggerBotConnection then
 		triggerBotConnection:Disconnect()
 	end
-	if skeletonRenderConnection then
-		skeletonRenderConnection:Disconnect()
-		skeletonRenderConnection = nil
-	end
-	for player in pairs(skeletonObjects) do
+	for player in pairs(skeletonData) do
 		removeSkeletonESP(player)
 	end
-	skeletonLinePool = {}
 	setNoclipEnabled(false)
 	setFlyEnabled(false)
 	if noclipRespawnConnection then
